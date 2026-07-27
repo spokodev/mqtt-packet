@@ -543,14 +543,14 @@ class Parser extends EventEmitter {
       if (packet.length > 0) {
         packet.reasonCode = this._parseByte()
         if (!constants.MQTT5_DISCONNECT_CODES[packet.reasonCode]) {
-          this._emitError(new Error('Invalid disconnect reason code'))
+          return this._emitError(new Error('Invalid disconnect reason code'))
         }
       } else {
         packet.reasonCode = 0
       }
       // properies mqtt 5 (only present when the remaining length is >= 2)
       if (packet.length >= 2) {
-        const properties = this._parseProperties()
+        const properties = this._parseProperties(packet.length)
         if (Object.getOwnPropertyNames(properties).length) {
           packet.properties = properties
         }
@@ -581,7 +581,7 @@ class Parser extends EventEmitter {
     }
     // properies mqtt 5 (only present when the remaining length is >= 2)
     if (packet.length >= 2) {
-      const properties = this._parseProperties()
+      const properties = this._parseProperties(packet.length)
       if (Object.getOwnPropertyNames(properties).length) {
         packet.properties = properties
       }
@@ -742,11 +742,18 @@ class Parser extends EventEmitter {
     }
   }
 
-  _parseProperties () {
+  _parseProperties (boundary) {
     debug('_parseProperties')
     const length = this._parseVarByteNum()
     const start = this._pos
     const end = start + length
+    // When the caller passes the packet boundary (DISCONNECT/AUTH pass their
+    // remaining length), a declared property length that runs past it would
+    // read the following pipelined packet's bytes. Treat that as malformed.
+    if (boundary !== undefined && end > boundary) {
+      this._emitError(new Error('Property length exceeds packet length'))
+      return false
+    }
     const result = {}
     while (this._pos < end) {
       const type = this._parseByte()

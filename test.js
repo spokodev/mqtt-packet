@@ -866,6 +866,42 @@ test('Version 5 minimal DISCONNECT/AUTH before another packet parses both', t =>
   t.end()
 })
 
+test('Version 5 DISCONNECT invalid reason code emits a single error', t => {
+  // An invalid reason code must stop parsing, not fall through into the
+  // property block and emit a second error (mirrors _parseAuth's return).
+  t.plan(2)
+  const parser = mqtt.parser({ protocolVersion: 5 })
+  let errors = 0
+  parser.on('error', e => {
+    errors++
+    t.equal(e.message, 'Invalid disconnect reason code', 'reason code error')
+  })
+  parser.on('packet', () => t.fail('no packet after error'))
+  parser.parse(Buffer.from([224, 3, 0x03, 0x01, 0x99]))
+  t.equal(errors, 1, 'exactly one error')
+})
+
+test('Version 5 DISCONNECT/AUTH property length past remaining length errors, not over-reads', t => {
+  // A declared property length must stay within the packet's remaining length,
+  // otherwise _parseProperties would read the following pipelined packet.
+  const cases = [
+    [224, 3, 0, 2, 1, 192, 0], // DISCONNECT rl3: propLen 2 > 1 available, then PINGREQ
+    [240, 3, 0, 2, 1, 192, 0] // AUTH, same shape
+  ]
+  t.plan(cases.length * 2)
+  for (const bytes of cases) {
+    const parser = mqtt.parser({ protocolVersion: 5 })
+    let errors = 0
+    parser.on('error', e => {
+      errors++
+      t.equal(e.message, 'Property length exceeds packet length', 'boundary error')
+    })
+    parser.on('packet', () => t.fail('no packet after boundary error'))
+    parser.parse(Buffer.from(bytes))
+    t.equal(errors, 1, 'exactly one error')
+  }
+})
+
 testParseAndGenerate('Version 5 DISCONNECT test 3', {
   cmd: 'disconnect',
   retain: false,
@@ -3059,7 +3095,7 @@ testParseError('Malformed Subscribe Payload', Buffer.from([
 
 test('Cannot parse property code type', t => {
   const packets = Buffer.from([
-    16, 16, 0, 4, 77, 81, 84, 84, 5, 2, 0, 60, 3, 33, 0, 20, 0, 0, 98, 2, 211, 1, 224, 2, 0, 32
+    16, 16, 0, 4, 77, 81, 84, 84, 5, 2, 0, 60, 3, 33, 0, 20, 0, 0, 98, 2, 211, 1, 224, 3, 0, 1, 0
   ])
 
   t.plan(3)
