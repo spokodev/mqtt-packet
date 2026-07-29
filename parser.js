@@ -27,10 +27,13 @@ class Parser extends EventEmitter {
   }
 
   _resetState () {
-    debug('_resetState: resetting packet, error, _list, and _stateCounter')
+    debug('_resetState: resetting packet, error, _list, _pos, and _stateCounter')
     this.packet = new Packet()
     this.error = null
     this._list = bl()
+    // Reset _pos too: a mid-packet error leaves it non-zero, and the next
+    // packet's _parseVarByteNum would use the stale value as padding.
+    this._pos = 0
     this._stateCounter = 0
   }
 
@@ -164,7 +167,7 @@ class Parser extends EventEmitter {
     packet.protocolId = protocolId
 
     // Parse constants version number
-    if (this._pos >= this._list.length) return this._emitError(new Error('Packet too short'))
+    if (this._pos >= packet.length) return this._emitError(new Error('Packet too short'))
 
     packet.protocolVersion = this._list.readUInt8(this._pos)
 
@@ -179,7 +182,7 @@ class Parser extends EventEmitter {
 
     this._pos++
 
-    if (this._pos >= this._list.length) {
+    if (this._pos >= packet.length) {
       return this._emitError(new Error('Packet too short'))
     }
 
@@ -273,7 +276,7 @@ class Parser extends EventEmitter {
     debug('_parseConnack')
     const packet = this.packet
 
-    if (this._list.length < 1) return null
+    if (packet.length < 1) return null
     const flags = this._list.readUInt8(this._pos++)
     if (flags > 1) {
       return this._emitError(new Error('Invalid connack flags, bits 7-1 must be set to 0'))
@@ -281,13 +284,15 @@ class Parser extends EventEmitter {
     packet.sessionPresent = !!(flags & constants.SESSIONPRESENT_MASK)
 
     if (this.settings.protocolVersion === 5) {
-      if (this._list.length >= 2) {
+      // Bound by packet.length, not _list.length: with a pipelined packet
+      // following, _list.length would be >= 2 and read the next packet's byte.
+      if (packet.length >= 2) {
         packet.reasonCode = this._list.readUInt8(this._pos++)
       } else {
         packet.reasonCode = 0
       }
     } else {
-      if (this._list.length < 2) return null
+      if (packet.length < 2) return null
       packet.returnCode = this._list.readUInt8(this._pos++)
     }
 
@@ -548,9 +553,9 @@ class Parser extends EventEmitter {
       } else {
         packet.reasonCode = 0
       }
-      // properies mqtt 5 (only present when the remaining length is >= 2)
+      // Properties are only present when the remaining length is >= 2 (MQTT-5 §3.14.2.2.1)
       if (packet.length >= 2) {
-        const properties = this._parseProperties(packet.length)
+        const properties = this._parseProperties()
         if (Object.getOwnPropertyNames(properties).length) {
           packet.properties = properties
         }
@@ -579,9 +584,9 @@ class Parser extends EventEmitter {
     } else {
       packet.reasonCode = 0
     }
-    // properies mqtt 5 (only present when the remaining length is >= 2)
+    // Properties are only present when the remaining length is >= 2 (MQTT-5 §3.15.2.2.1)
     if (packet.length >= 2) {
-      const properties = this._parseProperties(packet.length)
+      const properties = this._parseProperties()
       if (Object.getOwnPropertyNames(properties).length) {
         packet.properties = properties
       }
@@ -640,6 +645,9 @@ class Parser extends EventEmitter {
 
   _parseNum () {
     if (this._list.length - this._pos < 2) return -1
+    // Once packet.length is known, stay inside this packet's payload so a
+    // pipelined packet's bytes are never read as this one's.
+    if (this.packet.length !== -1 && this._pos + 2 > this.packet.length) return -1
 
     const result = this._list.readUInt16BE(this._pos)
     this._pos += 2
@@ -649,6 +657,7 @@ class Parser extends EventEmitter {
 
   _parse4ByteNum () {
     if (this._list.length - this._pos < 4) return -1
+    if (this.packet.length !== -1 && this._pos + 4 > this.packet.length) return -1
 
     const result = this._list.readUInt32BE(this._pos)
     this._pos += 4
@@ -665,8 +674,13 @@ class Parser extends EventEmitter {
     let result = false
     let current
     const padding = this._pos ? this._pos : 0
+    // Header phase (packet.length === -1) parses the Remaining Length against
+    // the whole buffer; payload phase stays inside this packet's boundary.
+    const limit = this.packet.length !== -1
+      ? Math.min(this._list.length, this.packet.length)
+      : this._list.length
 
-    while (bytes < maxBytes && (padding + bytes) < this._list.length) {
+    while (bytes < maxBytes && (padding + bytes) < limit) {
       current = this._list.readUInt8(padding + bytes++)
       value += mul * (current & constants.VARBYTEINT_MASK)
       mul *= 0x80
@@ -704,7 +718,7 @@ class Parser extends EventEmitter {
 
   _parseByte () {
     let result
-    if (this._pos < this._list.length) {
+    if (this._pos < this._list.length && (this.packet.length === -1 || this._pos < this.packet.length)) {
       result = this._list.readUInt8(this._pos)
       this._pos++
     }
@@ -742,15 +756,14 @@ class Parser extends EventEmitter {
     }
   }
 
-  _parseProperties (boundary) {
+  _parseProperties () {
     debug('_parseProperties')
     const length = this._parseVarByteNum()
     const start = this._pos
     const end = start + length
-    // When the caller passes the packet boundary (DISCONNECT/AUTH pass their
-    // remaining length), a declared property length that runs past it would
+    // A declared property length that runs past this packet's boundary would
     // read the following pipelined packet's bytes. Treat that as malformed.
-    if (boundary !== undefined && end > boundary) {
+    if (this.packet.length !== -1 && end > this.packet.length) {
       this._emitError(new Error('Property length exceeds packet length'))
       return false
     }
