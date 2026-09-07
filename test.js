@@ -845,23 +845,33 @@ testParseOnly('Version 5 DISCONNECT test 2', {
 ]), { protocolVersion: 5 }
 )
 
-test('Version 5 minimal DISCONNECT/AUTH before another packet parses both', t => {
-  // A minimal DISCONNECT/AUTH (remaining length 0 or 1) must be bounded by its
-  // own remaining length, not by the whole parse buffer, so a following packet
-  // is not mis-read as its reason code or properties.
+test('Version 5 DISCONNECT/AUTH before another packet parses both at every remaining length', t => {
+  // A DISCONNECT/AUTH must be bounded by its own remaining length, not by the
+  // whole parse buffer, so a following packet is not mis-read as its reason
+  // code or properties. Remaining length 0 and 1 are the regression; 2 and
+  // above are the path this PR newly gates with `packet.length >= 2` and
+  // already worked, so they are here to keep working.
+  const pingreq = [192, 0]
   const cases = [
-    { bytes: [224, 0, 192, 0], cmds: ['disconnect', 'pingreq'], rcs: [0, undefined] },
-    { bytes: [224, 1, 128, 192, 0], cmds: ['disconnect', 'pingreq'], rcs: [128, undefined] },
-    { bytes: [240, 0, 192, 0], cmds: ['auth', 'pingreq'], rcs: [0, undefined] }
+    { what: 'disconnect rl0', body: [224, 0], cmd: 'disconnect', rc: 0 },
+    { what: 'disconnect rl1', body: [224, 1, 128], cmd: 'disconnect', rc: 128 },
+    { what: 'disconnect rl2', body: [224, 2, 0, 0], cmd: 'disconnect', rc: 0 },
+    { what: 'disconnect rl7', body: [224, 7, 0, 5, 0x11, 0, 0, 0, 10], cmd: 'disconnect', rc: 0, props: { sessionExpiryInterval: 10 } },
+    { what: 'auth rl0', body: [240, 0], cmd: 'auth', rc: 0 },
+    { what: 'auth rl1', body: [240, 1, 24], cmd: 'auth', rc: 24 },
+    { what: 'auth rl2', body: [240, 2, 0, 0], cmd: 'auth', rc: 0 },
+    { what: 'auth rl7', body: [240, 7, 24, 5, 0x1F, 0, 2, 0x68, 0x69], cmd: 'auth', rc: 24, props: { reasonString: 'hi' } }
   ]
-  for (const { bytes, cmds, rcs } of cases) {
+  for (const { what, body, cmd, rc, props } of cases) {
     const parser = mqtt.parser({ protocolVersion: 5 })
     const got = []
     parser.on('packet', p => got.push(p))
-    parser.on('error', e => t.fail(`unexpected error: ${e.message}`))
-    parser.parse(Buffer.from(bytes))
-    t.deepEqual(got.map(p => p.cmd), cmds, 'both packets parsed')
-    t.deepEqual(got.map(p => p.reasonCode), rcs, 'reason codes')
+    parser.on('error', e => t.fail(`${what}: unexpected error: ${e.message}`))
+    const remaining = parser.parse(Buffer.from([...body, ...pingreq]))
+    t.deepEqual(got.map(p => p.cmd), [cmd, 'pingreq'], `${what}: both packets parsed`)
+    t.equal(got[0] && got[0].reasonCode, rc, `${what}: reason code`)
+    t.deepEqual(got[0] && got[0].properties, props, `${what}: properties`)
+    t.equal(remaining, 0, `${what}: remaining bytes`)
   }
   t.end()
 })
