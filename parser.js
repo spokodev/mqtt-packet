@@ -27,11 +27,7 @@ class Parser extends EventEmitter {
   }
 
   _resetState () {
-    // Log the discard: parse() returns _list.length before the reset, so this is
-    // the only place the number of bytes thrown away after an error is visible.
-    if (this._list) {
-      debug('_resetState: discarding %d buffered bytes at _pos %d of a %s packet', this._list.length, this._pos, this.packet.cmd)
-    }
+    debug('_resetState: resetting packet, error, _list, _pos, _truncated, _blockEnd, and _stateCounter')
     this.packet = new Packet()
     this.error = null
     this._list = bl()
@@ -391,6 +387,12 @@ class Parser extends EventEmitter {
       debug('_parseSubscribe: push subscription `%s` to subscription', subscription)
       packet.subscriptions.push(subscription)
     }
+
+    // The payload carries at least one topic filter [MQTT-3.8.3-3]; without this
+    // a property block that swallows the payload parses as an empty SUBSCRIBE.
+    if (!packet.subscriptions.length) {
+      return this._emitError(new Error('Malformed subscribe, no topic filters specified'))
+    }
   }
 
   _parseSuback () {
@@ -453,6 +455,11 @@ class Parser extends EventEmitter {
       // Push topic to unsubscriptions
       debug('_parseUnsubscribe: push topic `%s` to unsubscriptions', topic)
       packet.unsubscriptions.push(topic)
+    }
+
+    // At least one topic filter [MQTT-3.10.3-2].
+    if (!packet.unsubscriptions.length) {
+      return this._emitError(new Error('Malformed unsubscribe, no topic filters specified'))
     }
   }
 
@@ -527,25 +534,36 @@ class Parser extends EventEmitter {
     return true
   }
 
+  // DISCONNECT and AUTH share a variable header: the reason code may be omitted
+  // when it is 0 and there are no properties, and below remaining length 2 there
+  // is no property length either (MQTT-5 §3.14.2.2.1, §3.15.2.2.1). Both bound by
+  // packet.length, never _list.length - reading either from the running buffer
+  // is the bug this whole change is about, and it was there twice.
+  _parseReasonCodeAndProperties (codes) {
+    const packet = this.packet
+
+    if (packet.length > 0) {
+      packet.reasonCode = this._parseByte()
+      if (!codes[packet.reasonCode]) {
+        this._emitError(new Error('Invalid ' + packet.cmd + ' reason code'))
+        return false
+      }
+    } else {
+      packet.reasonCode = 0
+    }
+
+    if (packet.length >= 2) {
+      return this._parsePropertiesInto(packet)
+    }
+    return true
+  }
+
   // parse disconnect packet
   _parseDisconnect () {
-    const packet = this.packet
     debug('_parseDisconnect')
 
     if (this.settings.protocolVersion === 5) {
-      // response code
-      if (packet.length > 0) {
-        packet.reasonCode = this._parseByte()
-        if (!constants.MQTT5_DISCONNECT_CODES[packet.reasonCode]) {
-          return this._emitError(new Error('Invalid disconnect reason code'))
-        }
-      } else {
-        packet.reasonCode = 0
-      }
-      // Properties are only present when the remaining length is >= 2 (MQTT-5 §3.14.2.2.1)
-      if (packet.length >= 2) {
-        if (!this._parsePropertiesInto(packet)) return
-      }
+      if (!this._parseReasonCodeAndProperties(constants.MQTT5_DISCONNECT_CODES)) return
     }
 
     debug('_parseDisconnect result: true')
@@ -555,25 +573,12 @@ class Parser extends EventEmitter {
   // parse auth packet
   _parseAuth () {
     debug('_parseAuth')
-    const packet = this.packet
 
     if (this.settings.protocolVersion !== 5) {
       return this._emitError(new Error('Not supported auth packet for this version MQTT'))
     }
 
-    // response code
-    if (packet.length > 0) {
-      packet.reasonCode = this._parseByte()
-      if (!constants.MQTT5_AUTH_CODES[packet.reasonCode]) {
-        return this._emitError(new Error('Invalid auth reason code'))
-      }
-    } else {
-      packet.reasonCode = 0
-    }
-    // Properties are only present when the remaining length is >= 2 (MQTT-5 §3.15.2.2.1)
-    if (packet.length >= 2) {
-      if (!this._parsePropertiesInto(packet)) return
-    }
+    if (!this._parseReasonCodeAndProperties(constants.MQTT5_AUTH_CODES)) return
 
     debug('_parseAuth: result: true')
     return true
@@ -695,9 +700,7 @@ class Parser extends EventEmitter {
     // bytes means the varint is truncated by a boundary, not that more data is
     // on the way (MQTT-5 §4.13 Malformed Packet).
     if (!result && ((bytes === maxBytes && this._list.length >= bytes) || this.packet.length !== -1)) {
-      this._emitError(new Error(this.packet.cmd
-        ? 'Malformed ' + this.packet.cmd + ', invalid variable byte integer'
-        : 'Invalid variable byte integer'))
+      this._emitError(new Error('Malformed ' + this.packet.cmd + ', invalid variable byte integer'))
     }
 
     // The header phase re-runs from _pos 0 until the whole varint has arrived,
@@ -872,7 +875,13 @@ class Parser extends EventEmitter {
   }
 
   _emitError (err) {
-    debug('_emitError', err)
+    // Every parse failure is a Malformed Packet (MQTT-5 §4.13). The code and cmd
+    // let a consumer react without matching on the message text, and the counts
+    // say how much of the stream is about to be dropped - the next parse() calls
+    // _resetState, and a consumer that tears down on error never gets there.
+    err.code = err.code || 'MALFORMED_PACKET'
+    if (this.packet.cmd) err.cmd = err.cmd || this.packet.cmd
+    debug('_emitError: %s (_pos %d, %d buffered bytes discarded)', err.message, this._pos, this._list.length)
     this.error = err
     this.emit('error', err)
   }

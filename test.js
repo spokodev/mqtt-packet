@@ -1223,6 +1223,67 @@ testParseError('Malformed unsuback, invalid variable byte integer', Buffer.from(
   0x00, 0x01 // messageId 1, and no Property Length
 ]), { protocolVersion: 5 })
 
+// A SUBACK/UNSUBACK carries one reason code per subscription, and a
+// SUBSCRIBE/UNSUBSCRIBE at least one topic filter (MQTT-5 §3.9.3, §3.11.3,
+// [MQTT-3.8.3-3], [MQTT-3.10.3-2]). Without these a property block that eats the
+// payload parses as a packet with an empty list and no error at all - the same
+// silent accept this change is about, one field further on.
+testParseError('Malformed suback, no reason codes specified', Buffer.from([
+  0x90, 0x03, // Fixed Header (SUBACK, Remaining Length 3)
+  0x00, 0x01, // messageId 1
+  0x00, // Property Length 0, and no reason codes after it
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+testParseError('Malformed suback, no reason codes specified', Buffer.from([
+  0x90, 0x08, // Fixed Header (SUBACK, Remaining Length 8)
+  0x00, 0x01, // messageId 1
+  0x05, // Property Length 5
+  0x1F, 0x00, 0x02, 0x68, 0x69, // property: reasonString 'hi', filling the packet
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+testParseError('Malformed suback, no reason codes specified', Buffer.from([
+  0x90, 0x02, // Fixed Header (SUBACK, Remaining Length 2)
+  0x00, 0x01, // messageId 1, and no return codes
+  ...PINGREQ
+]), { protocolVersion: 4 })
+
+testParseError('Malformed unsuback, no reason codes specified', Buffer.from([
+  0xB0, 0x03, // Fixed Header (UNSUBACK, Remaining Length 3)
+  0x00, 0x01, // messageId 1
+  0x00, // Property Length 0, and no reason codes after it
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+testParseError('Malformed subscribe, no topic filters specified', Buffer.from([
+  0x82, 0x03, // Fixed Header (SUBSCRIBE, Remaining Length 3)
+  0x00, 0x01, // messageId 1
+  0x00, // Property Length 0, and no topic filters after it
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+testParseError('Malformed unsubscribe, no topic filters specified', Buffer.from([
+  0xA2, 0x03, // Fixed Header (UNSUBSCRIBE, Remaining Length 3)
+  0x00, 0x01, // messageId 1
+  0x00, // Property Length 0, and no topic filters after it
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+test('parser errors carry a code and the packet type', t => {
+  // The message text is the only discriminator a consumer had, and this change
+  // rewrites several of them; `code` and `cmd` are what to match on instead.
+  t.plan(3)
+  const parser = mqtt.parser({ protocolVersion: 5 })
+  parser.on('packet', () => t.fail('no packet from a malformed input'))
+  parser.on('error', err => {
+    t.equal(err.code, 'MALFORMED_PACKET', 'code')
+    t.equal(err.cmd, 'disconnect', 'cmd')
+    t.ok(err instanceof Error, 'still an Error')
+  })
+  parser.parse(Buffer.from([0xE0, 0x03, 0x00, 0x02, 0x01]))
+})
+
 // A failed property read must stop the packet's parser before it reads the
 // fields that follow the property block. End to end this is invisible:
 // `_parsePropertiesInto` emits, and `parse()` refuses to emit a packet while
