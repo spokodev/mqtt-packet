@@ -2,6 +2,7 @@ const util = require('util')
 
 const test = require('tape')
 const mqtt = require('./')
+const constants = require('./constants')
 const WS = require('readable-stream').Writable
 
 function normalExpectedObject (object) {
@@ -119,13 +120,15 @@ function testParseOnly (name, object, buffer, opts) {
 
 function testParseError (expected, fixture, opts) {
   test(expected, t => {
-    t.plan(2)
+    t.plan(3)
 
     const parser = mqtt.parser(opts)
+    const expectedCmd = constants.types[fixture[0] >> 4]
 
     parser.on('error', err => {
       t.equal(err.message, expected, 'expected error message')
       t.equal(err.code, 'MALFORMED_PACKET', 'expected error code')
+      t.equal(err.cmd, expectedCmd, 'expected error cmd')
     })
 
     parser.on('packet', () => {
@@ -1254,6 +1257,25 @@ testParseError('Malformed unsuback, no reason codes specified', Buffer.from([
   0xB0, 0x03, // Fixed Header (UNSUBACK, Remaining Length 3)
   0x00, 0x01, // messageId 1
   0x00, // Property Length 0, and no reason codes after it
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+// A single byte left is not a topic filter but it is not nothing either: the
+// loop must enter and fail on the truncated filter, rather than stop short and
+// report an empty list.
+testParseError('Cannot parse topic', Buffer.from([
+  0x82, 0x04, // Fixed Header (SUBSCRIBE, Remaining Length 4)
+  0x00, 0x01, // messageId 1
+  0x00, // Property Length 0
+  0x00, // one byte where a topic filter should start
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+testParseError('Cannot parse topic', Buffer.from([
+  0xA2, 0x04, // Fixed Header (UNSUBSCRIBE, Remaining Length 4)
+  0x00, 0x01, // messageId 1
+  0x00, // Property Length 0
+  0x00, // one byte where a topic filter should start
   ...PINGREQ
 ]), { protocolVersion: 5 })
 

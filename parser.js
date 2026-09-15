@@ -286,9 +286,9 @@ class Parser extends EventEmitter {
 
     if (this.settings.protocolVersion === 5) {
       packet.reasonCode = this._parseByte()
-      // The property length is only there from remaining length 3 on (MQTT-5
-      // §3.2.2.3): a v4-only server refusing a v5 CONNECT answers in v4 format,
-      // which has no property block at all.
+      // MQTT-5 §3.2.2.3 makes the property length unconditional, but a v4-only
+      // server refusing a v5 CONNECT answers in v4 format, which has no property
+      // block - so accept the 2-byte form rather than demand the full 3.
       if (packet.length >= 3) {
         if (!this._parsePropertiesInto(packet)) return
       }
@@ -340,7 +340,7 @@ class Parser extends EventEmitter {
       if (!this._parsePropertiesInto(packet)) return
     }
 
-    while (this._pos < packet.length) {
+    while (!this._overruns(1)) {
       // Parse topic
       topic = this._parseString()
       if (topic === null) return this._emitError(new Error('Cannot parse topic'))
@@ -424,7 +424,8 @@ class Parser extends EventEmitter {
       this.packet.granted.push(code)
     }
 
-    // One reason code per subscription, in 3.1.1 as well as 5.0 (§3.9.3). An
+    // One reason code per subscription, in 3.1.1 as well as 5.0 (MQTT-5 §3.9.3,
+    // MQTT-3.1.1 §3.9.3). An
     // empty list means something upstream - usually a property block - consumed
     // the payload, which used to be accepted silently.
     if (!packet.granted.length) {
@@ -448,7 +449,7 @@ class Parser extends EventEmitter {
       if (!this._parsePropertiesInto(packet)) return
     }
 
-    while (this._pos < packet.length) {
+    while (!this._overruns(1)) {
       // Parse topic
       const topic = this._parseString()
       if (topic === null) return this._emitError(new Error('Cannot parse topic'))
@@ -882,7 +883,7 @@ class Parser extends EventEmitter {
     // say how much of the stream is about to be dropped - the next parse() calls
     // _resetState, and a consumer that tears down on error never gets there.
     err.code = 'MALFORMED_PACKET'
-    if (this.packet.cmd) err.cmd = this.packet.cmd
+    err.cmd = this.packet.cmd
     debug('_emitError: %s (_pos %d, %d buffered bytes discarded)', err.message, this._pos, this._list.length)
     this.error = err
     this.emit('error', err)
