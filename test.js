@@ -767,21 +767,14 @@ testParseOnly('Version 5 PUBACK test 3', {
 ]), { protocolVersion: 5 }
 )
 
-testParseOnly('Version 5 CONNACK test 1', {
-  cmd: 'connack',
-  retain: false,
-  qos: 0,
-  dup: false,
-  length: 1,
-  topic: null,
-  payload: null,
-  sessionPresent: true,
-  reasonCode: 0
-}, Buffer.from([
-  32, 1, // Fixed Header (CONNACK, Remaining Length)
-  1 // Variable Header (Session Present: 1 => true, Implied Reason code: Success, Implied no properties)
-]), { protocolVersion: 5 }
-)
+// A CONNACK always carries Connect Acknowledge Flags and a reason code
+// (MQTT-5 3.2.2). With only the flags byte there is no reason code to report,
+// and defaulting it to Success would tell the client an unauthenticated
+// connection was accepted - so remaining length 1 is rejected.
+testParseError('Malformed connack, packet too short', Buffer.from([
+  32, 1, // Fixed Header (CONNACK, Remaining Length 1)
+  1 // Connect Acknowledge Flags (session present), and nothing else
+]), { protocolVersion: 5 })
 
 testParseOnly('Version 5 CONNACK test 2', {
   cmd: 'connack',
@@ -941,18 +934,9 @@ test('reason code and properties stop at the packet boundary when pipelined', t 
       props: { reasonString: 'hi' }
     },
     {
-      // The 1- and 2-byte forms are the ones 'Version 5 CONNACK test 1' and
-      // 'Version 4 CONACK in Version 5 mode' already document; the point here
-      // is that a following packet no longer supplies the missing bytes.
-      what: 'CONNACK remaining length 1, implied reason code',
-      bytes: [
-        0x20, 0x01, // Fixed Header (CONNACK, Remaining Length 1)
-        0x00 // Connect Acknowledge Flags (session not present)
-      ],
-      cmd: 'connack',
-      rc: 0
-    },
-    {
+      // The 2-byte form is what 'Version 4 CONACK in Version 5 mode' documents:
+      // a v4-only server refusing a v5 CONNECT. The point here is that a
+      // following packet no longer supplies the missing property length.
       what: 'CONNACK remaining length 2, version 4 format',
       bytes: [
         0x20, 0x02, // Fixed Header (CONNACK, Remaining Length 2)
@@ -1004,7 +988,7 @@ test('reason code and properties stop at the packet boundary when pipelined', t 
 
 // A declared Property Length that runs past the remaining length used to
 // absorb the following packet's header bytes into a property value.
-testParseError('Property length exceeds disconnect packet length', Buffer.from([
+testParseError('Malformed disconnect, property length exceeds remaining length', Buffer.from([
   0xE0, 0x03, // Fixed Header (DISCONNECT, Remaining Length 3)
   0x00, // reason code (Normal disconnection)
   0x02, // Property Length 2, but only 1 byte is left in this packet
@@ -1012,7 +996,7 @@ testParseError('Property length exceeds disconnect packet length', Buffer.from([
   ...PINGREQ
 ]), { protocolVersion: 5 })
 
-testParseError('Property length exceeds auth packet length', Buffer.from([
+testParseError('Malformed auth, property length exceeds remaining length', Buffer.from([
   0xF0, 0x03, // Fixed Header (AUTH, Remaining Length 3)
   0x00, // reason code (Success)
   0x02, // Property Length 2, but only 1 byte is left in this packet
@@ -1021,21 +1005,21 @@ testParseError('Property length exceeds auth packet length', Buffer.from([
 ]), { protocolVersion: 5 })
 
 // A Property Length varint whose continuation bit runs into the next packet.
-testParseError('Invalid variable byte integer', Buffer.from([
+testParseError('Malformed disconnect, invalid variable byte integer', Buffer.from([
   0xE0, 0x02, // Fixed Header (DISCONNECT, Remaining Length 2)
   0x00, // reason code (Normal disconnection)
   0x80, // Property Length, continuation bit set with no byte after it
   ...PINGREQ
 ]), { protocolVersion: 5 })
 
-testParseError('Invalid variable byte integer', Buffer.from([
+testParseError('Malformed auth, invalid variable byte integer', Buffer.from([
   0xF0, 0x02, // Fixed Header (AUTH, Remaining Length 2)
   0x18, // reason code (Continue authentication)
   0x80, // Property Length, continuation bit set with no byte after it
   ...PINGREQ
 ]), { protocolVersion: 5 })
 
-testParseError('Invalid variable byte integer', Buffer.from([
+testParseError('Malformed connack, invalid variable byte integer', Buffer.from([
   0x20, 0x03, // Fixed Header (CONNACK, Remaining Length 3)
   0x00, // Connect Acknowledge Flags (session not present)
   0x00, // reason code (Success)
@@ -1045,7 +1029,7 @@ testParseError('Invalid variable byte integer', Buffer.from([
 
 // A property value that straddles the boundary: _parseNum, _parse4ByteNum and
 // _parseBuffer stop at it, and the stop is reported rather than left as null.
-testParseError('Property receiveMaximum exceeds disconnect packet length', Buffer.from([
+testParseError('Malformed disconnect, property receiveMaximum exceeds the property length', Buffer.from([
   0xE0, 0x04, // Fixed Header (DISCONNECT, Remaining Length 4)
   0x00, // reason code (Normal disconnection)
   0x02, // Property Length 2
@@ -1053,7 +1037,7 @@ testParseError('Property receiveMaximum exceeds disconnect packet length', Buffe
   ...PINGREQ
 ]), { protocolVersion: 5 })
 
-testParseError('Property sessionExpiryInterval exceeds disconnect packet length', Buffer.from([
+testParseError('Malformed disconnect, property sessionExpiryInterval exceeds the property length', Buffer.from([
   0xE0, 0x05, // Fixed Header (DISCONNECT, Remaining Length 5)
   0x00, // reason code (Normal disconnection)
   0x03, // Property Length 3
@@ -1061,7 +1045,7 @@ testParseError('Property sessionExpiryInterval exceeds disconnect packet length'
   ...PINGREQ
 ]), { protocolVersion: 5 })
 
-testParseError('Property authenticationData exceeds disconnect packet length', Buffer.from([
+testParseError('Malformed disconnect, property authenticationData exceeds the property length', Buffer.from([
   0xE0, 0x05, // Fixed Header (DISCONNECT, Remaining Length 5)
   0x00, // reason code (Normal disconnection)
   0x03, // Property Length 3
@@ -1069,7 +1053,7 @@ testParseError('Property authenticationData exceeds disconnect packet length', B
   ...PINGREQ
 ]), { protocolVersion: 5 })
 
-testParseError('Property userProperties exceeds disconnect packet length', Buffer.from([
+testParseError('Malformed disconnect, property userProperties exceeds the property length', Buffer.from([
   0xE0, 0x06, // Fixed Header (DISCONNECT, Remaining Length 6)
   0x00, // reason code (Normal disconnection)
   0x04, // Property Length 4
@@ -1079,13 +1063,13 @@ testParseError('Property userProperties exceeds disconnect packet length', Buffe
 
 // A messageId that straddles the boundary used to be emitted as -1, or as two
 // bytes stolen from the next packet.
-testParseError('Cannot parse messageId', Buffer.from([
+testParseError('Malformed puback, cannot parse messageId', Buffer.from([
   0x40, 0x01, // Fixed Header (PUBACK, Remaining Length 1)
   0x00, // half a messageId
   ...PINGREQ
 ]), { protocolVersion: 5 })
 
-testParseError('Cannot parse messageId', Buffer.from([
+testParseError('Malformed suback, cannot parse messageId', Buffer.from([
   0x90, 0x01, // Fixed Header (SUBACK, Remaining Length 1)
   0x00, // half a messageId
   ...PINGREQ
@@ -1093,7 +1077,7 @@ testParseError('Cannot parse messageId', Buffer.from([
 
 // A CONNACK with no Connect Acknowledge Flags byte must be rejected, not
 // emitted as an empty packet with the next packet's byte for flags.
-testParseError('Packet too short', Buffer.from([
+testParseError('Malformed connack, packet too short', Buffer.from([
   0x20, 0x00, // Fixed Header (CONNACK, Remaining Length 0)
   ...PINGREQ
 ]), { protocolVersion: 5 })
@@ -1113,6 +1097,130 @@ testParseError('Packet too short', Buffer.from([
   0x00, 0x04, 0x4D, 0x51, 0x54, 0x54, // protocol name 'MQTT', then nothing
   ...PINGREQ
 ]), { protocolVersion: 4 })
+
+// Every packet type that reads a property block stops on a malformed one. Each
+// case declares a Property Length longer than the bytes left in the packet, so
+// it exercises that type's own `_readProperties` call site.
+testParseError('Malformed connect, property length exceeds remaining length', Buffer.from([
+  0x10, 0x0D, // Fixed Header (CONNECT, Remaining Length 13)
+  0x00, 0x04, 0x4D, 0x51, 0x54, 0x54, // protocol name 'MQTT'
+  0x05, // protocol version 5
+  0x02, // connect flags (clean start)
+  0x00, 0x3C, // keepalive 60
+  0x05, // Property Length 5, with 2 bytes left in the packet
+  0x00, 0x00,
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+testParseError('Malformed connect, property length exceeds remaining length', Buffer.from([
+  0x10, 0x0E, // Fixed Header (CONNECT, Remaining Length 14)
+  0x00, 0x04, 0x4D, 0x51, 0x54, 0x54, // protocol name 'MQTT'
+  0x05, // protocol version 5
+  0x04, // connect flags (will)
+  0x00, 0x3C, // keepalive 60
+  0x00, // Property Length 0
+  0x00, 0x00, // clientId ''
+  0x05, // will Property Length 5, with nothing left in the packet
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+testParseError('Malformed publish, property length exceeds remaining length', Buffer.from([
+  0x30, 0x07, // Fixed Header (PUBLISH, Remaining Length 7)
+  0x00, 0x04, 0x74, 0x65, 0x73, 0x74, // topic 'test'
+  0x05, // Property Length 5, with nothing left in the packet
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+testParseError('Malformed subscribe, property length exceeds remaining length', Buffer.from([
+  0x82, 0x03, // Fixed Header (SUBSCRIBE, Remaining Length 3)
+  0x00, 0x01, // messageId 1
+  0x05, // Property Length 5, with nothing left in the packet
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+testParseError('Malformed suback, property length exceeds remaining length', Buffer.from([
+  0x90, 0x03, // Fixed Header (SUBACK, Remaining Length 3)
+  0x00, 0x01, // messageId 1
+  0x05, // Property Length 5, with nothing left in the packet
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+testParseError('Malformed unsubscribe, property length exceeds remaining length', Buffer.from([
+  0xA2, 0x03, // Fixed Header (UNSUBSCRIBE, Remaining Length 3)
+  0x00, 0x01, // messageId 1
+  0x05, // Property Length 5, with nothing left in the packet
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+testParseError('Malformed unsuback, property length exceeds remaining length', Buffer.from([
+  0xB0, 0x03, // Fixed Header (UNSUBACK, Remaining Length 3)
+  0x00, 0x01, // messageId 1
+  0x05, // Property Length 5, with nothing left in the packet
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+testParseError('Malformed puback, property length exceeds remaining length', Buffer.from([
+  0x40, 0x05, // Fixed Header (PUBACK, Remaining Length 5)
+  0x00, 0x01, // messageId 1
+  0x00, // reason code (Success)
+  0x05, // Property Length 5, with 1 byte left in the packet
+  0x00,
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+// A property value must stay inside the Property Length, not just inside the
+// packet: otherwise it reads the packet's own body and silently re-frames every
+// field after it.
+testParseError('Malformed subscribe, property payloadFormatIndicator exceeds the property length', Buffer.from([
+  0x82, 0x0D, // Fixed Header (SUBSCRIBE, Remaining Length 13)
+  0x00, 0x01, // messageId 1
+  0x01, // Property Length 1
+  0x01, 0xFF, // property: payloadFormatIndicator, 2 bytes in a 1-byte block
+  0x00, 0x05, 0x61, 0x2F, 0x62, 0x2F, 0x63, // topic 'a/b/c'
+  0x00 // subscription options
+]), { protocolVersion: 5 })
+
+testParseError('Malformed auth, property authenticationMethod exceeds the property length', Buffer.from([
+  0xF0, 0x09, // Fixed Header (AUTH, Remaining Length 9)
+  0x18, // reason code (Continue authentication)
+  0x01, // Property Length 1
+  0x15, 0x00, 0x04, 0x74, 0x65, 0x73, 0x74 // property: authenticationMethod 'test', 7 bytes in a 1-byte block
+]), { protocolVersion: 5 })
+
+testParseError('Malformed publish, property sessionExpiryInterval exceeds the property length', Buffer.from([
+  0x30, 0x0A, // Fixed Header (PUBLISH, Remaining Length 10)
+  0x00, 0x01, 0x61, // topic 'a'
+  0x03, // Property Length 3
+  0x11, 0x00, 0x00, // property: sessionExpiryInterval (int32), 5 bytes in a 3-byte block
+  0x01, 0x02, 0x03 // payload
+]), { protocolVersion: 5 })
+
+testParseError('Malformed publish, invalid variable byte integer', Buffer.from([
+  0x30, 0x09, // Fixed Header (PUBLISH, Remaining Length 9)
+  0x00, 0x01, 0x61, // topic 'a'
+  0x02, // Property Length 2
+  0x0B, 0x85, // property: subscriptionIdentifier, a varint continuing past the block
+  0x01, 0x02, 0x03 // payload
+]), { protocolVersion: 5 })
+
+// The Property Length byte is mandatory in a v5 PUBLISH/SUBACK/UNSUBACK
+// (MQTT-5 3.3.2.3 / 3.9.2.1.1 / 3.11.2.1.1) - unlike DISCONNECT and AUTH,
+// where the spec lets it be omitted below remaining length 2. These used to
+// parse as packets with no properties and an empty payload.
+testParseError('Malformed publish, invalid variable byte integer', Buffer.from([
+  0x30, 0x03, // Fixed Header (PUBLISH, Remaining Length 3)
+  0x00, 0x01, 0x61 // topic 'a', and no Property Length
+]), { protocolVersion: 5 })
+
+testParseError('Malformed suback, invalid variable byte integer', Buffer.from([
+  0x90, 0x02, // Fixed Header (SUBACK, Remaining Length 2)
+  0x00, 0x01 // messageId 1, and no Property Length
+]), { protocolVersion: 5 })
+
+testParseError('Malformed unsuback, invalid variable byte integer', Buffer.from([
+  0xB0, 0x02, // Fixed Header (UNSUBACK, Remaining Length 2)
+  0x00, 0x01 // messageId 1, and no Property Length
+]), { protocolVersion: 5 })
 
 test('the parser stays usable after a packet-boundary error', t => {
   // _resetState did not clear _pos, so the next packet's _parseVarByteNum used

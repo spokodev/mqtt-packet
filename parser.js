@@ -27,14 +27,15 @@ class Parser extends EventEmitter {
   }
 
   _resetState () {
-    debug('_resetState: resetting packet, error, _list, _pos, _truncated, and _stateCounter')
+    debug('_resetState: resetting packet, error, _list, _pos, _truncated, _blockEnd, and _stateCounter')
     this.packet = new Packet()
     this.error = null
     this._list = bl()
     // Reset _pos too: a mid-packet error leaves it non-zero, and the next
-    // packet's _parseVarByteNum would use the stale value as padding.
+    // packet's reads would start from the stale offset.
     this._pos = 0
     this._truncated = false
+    this._blockEnd = -1
     this._stateCounter = 0
   }
 
@@ -168,7 +169,7 @@ class Parser extends EventEmitter {
     packet.protocolId = protocolId
 
     // Parse constants version number
-    if (this._pos >= packet.length) return this._emitError(new Error('Packet too short'))
+    if (this._overruns(1)) return this._emitError(new Error('Packet too short'))
 
     packet.protocolVersion = this._list.readUInt8(this._pos)
 
@@ -183,7 +184,7 @@ class Parser extends EventEmitter {
 
     this._pos++
 
-    if (this._pos >= packet.length) {
+    if (this._overruns(1)) {
       return this._emitError(new Error('Packet too short'))
     }
 
@@ -222,7 +223,7 @@ class Parser extends EventEmitter {
 
     // parse properties
     if (packet.protocolVersion === 5) {
-      if (!this._readProperties(packet)) return
+      if (!this._parsePropertiesInto(packet)) return
     }
     // Parse clientId
     const clientId = this._parseString()
@@ -232,7 +233,7 @@ class Parser extends EventEmitter {
 
     if (flags.will) {
       if (packet.protocolVersion === 5) {
-        if (!this._readProperties(packet.will)) return
+        if (!this._parsePropertiesInto(packet.will)) return
       }
       // Parse will topic
       topic = this._parseString()
@@ -271,32 +272,28 @@ class Parser extends EventEmitter {
     debug('_parseConnack')
     const packet = this.packet
 
-    // Every gate below reads packet.length, not _list.length: with a pipelined
-    // packet following, _list.length spans it and the next packet's header byte
-    // would be read as this CONNACK's flags, reason code or property length.
-    if (packet.length < 1) return this._emitError(new Error('Packet too short'))
+    // Ack flags plus a reason/return code are always on the wire (MQTT-5
+    // §3.2.2). Gate on packet.length, not _list.length, so a pipelined packet
+    // is never read as this CONNACK's bytes - and so a CONNACK carrying no code
+    // byte is rejected rather than reported as Success.
+    if (packet.length < 2) return this._emitError(new Error('Malformed connack, packet too short'))
 
-    const flags = this._list.readUInt8(this._pos++)
+    const flags = this._parseByte()
     if (flags > 1) {
       return this._emitError(new Error('Invalid connack flags, bits 7-1 must be set to 0'))
     }
     packet.sessionPresent = !!(flags & constants.SESSIONPRESENT_MASK)
 
     if (this.settings.protocolVersion === 5) {
-      // A v5 server may answer in v4 format (no property length) and this
-      // parser accepts the 1-byte form with an implied Success reason code, so
-      // gate each field on its own byte rather than demanding the full 3.
-      if (packet.length >= 2) {
-        packet.reasonCode = this._list.readUInt8(this._pos++)
-      } else {
-        packet.reasonCode = 0
-      }
+      packet.reasonCode = this._parseByte()
+      // The property length is only there from remaining length 3 on (MQTT-5
+      // §3.2.2.3): a v4-only server refusing a v5 CONNECT answers in v4 format,
+      // which has no property block at all.
       if (packet.length >= 3) {
-        if (!this._readProperties(packet)) return
+        if (!this._parsePropertiesInto(packet)) return
       }
     } else {
-      if (packet.length < 2) return this._emitError(new Error('Packet too short'))
-      packet.returnCode = this._list.readUInt8(this._pos++)
+      packet.returnCode = this._parseByte()
     }
 
     debug('_parseConnack: complete')
@@ -314,7 +311,7 @@ class Parser extends EventEmitter {
 
     // Properties mqtt 5
     if (this.settings.protocolVersion === 5) {
-      if (!this._readProperties(packet)) return
+      if (!this._parsePropertiesInto(packet)) return
     }
 
     packet.payload = this._list.slice(this._pos, packet.length)
@@ -340,7 +337,7 @@ class Parser extends EventEmitter {
 
     // Properties mqtt 5
     if (this.settings.protocolVersion === 5) {
-      if (!this._readProperties(packet)) return
+      if (!this._parsePropertiesInto(packet)) return
     }
 
     while (this._pos < packet.length) {
@@ -403,7 +400,7 @@ class Parser extends EventEmitter {
 
     // Properties mqtt 5
     if (this.settings.protocolVersion === 5) {
-      if (!this._readProperties(packet)) return
+      if (!this._parsePropertiesInto(packet)) return
     }
 
     // Parse granted QoSes
@@ -435,7 +432,7 @@ class Parser extends EventEmitter {
 
     // Properties mqtt 5
     if (this.settings.protocolVersion === 5) {
-      if (!this._readProperties(packet)) return
+      if (!this._parsePropertiesInto(packet)) return
     }
 
     while (this._pos < packet.length) {
@@ -462,7 +459,7 @@ class Parser extends EventEmitter {
 
     // Properties mqtt 5
     if (this.settings.protocolVersion === 5) {
-      if (!this._readProperties(packet)) return
+      if (!this._parsePropertiesInto(packet)) return
       // Parse granted QoSes
       packet.granted = []
 
@@ -508,7 +505,7 @@ class Parser extends EventEmitter {
 
       if (packet.length > 3) {
         // properies mqtt 5
-        if (!this._readProperties(packet)) return
+        if (!this._parsePropertiesInto(packet)) return
       }
     }
 
@@ -532,7 +529,7 @@ class Parser extends EventEmitter {
       }
       // Properties are only present when the remaining length is >= 2 (MQTT-5 §3.14.2.2.1)
       if (packet.length >= 2) {
-        if (!this._readProperties(packet)) return
+        if (!this._parsePropertiesInto(packet)) return
       }
     }
 
@@ -560,7 +557,7 @@ class Parser extends EventEmitter {
     }
     // Properties are only present when the remaining length is >= 2 (MQTT-5 §3.15.2.2.1)
     if (packet.length >= 2) {
-      if (!this._readProperties(packet)) return
+      if (!this._parsePropertiesInto(packet)) return
     }
 
     debug('_parseAuth: result: true')
@@ -573,7 +570,7 @@ class Parser extends EventEmitter {
     packet.messageId = this._parseNum()
 
     if (packet.messageId === -1) {
-      this._emitError(new Error('Cannot parse messageId'))
+      this._emitError(new Error('Malformed ' + packet.cmd + ', cannot parse messageId'))
       return false
     }
 
@@ -581,13 +578,21 @@ class Parser extends EventEmitter {
     return true
   }
 
-  // True when reading `n` more bytes would leave this packet. In the payload
-  // phase the whole packet is already buffered, so that is a Malformed Packet
-  // (MQTT-5 §1.5.5) rather than "wait for more data" - _truncated records it so
-  // _parseProperties can turn an otherwise silent null into an error.
+  // The innermost boundary the current read must stay inside: the open property
+  // block if there is one, else this packet's remaining length. -1 is the header
+  // phase, where the remaining length itself is read against the whole buffer.
+  _readEnd () {
+    return this._blockEnd !== -1 ? this._blockEnd : this.packet.length
+  }
+
+  // True when reading `n` more bytes would cross that boundary. In the payload
+  // phase the whole packet is already buffered, so crossing it is a Malformed
+  // Packet (MQTT-5 §4.13) rather than "wait for more data" - _truncated records
+  // it so _parseProperties can turn an otherwise silent null into an error.
   _overruns (n) {
     const end = this._pos + n
-    if (this.packet.length !== -1 && end > this.packet.length) {
+    const limit = this._readEnd()
+    if (limit !== -1 && end > limit) {
       this._truncated = true
       return true
     }
@@ -653,13 +658,9 @@ class Parser extends EventEmitter {
     let result = false
     let current
     const start = this._pos
-    // Header phase (packet.length === -1) parses the Remaining Length against
-    // the whole buffer; payload phase stays inside this packet's boundary.
-    const limit = this.packet.length === -1
-      ? this._list.length
-      : Math.min(this._list.length, this.packet.length)
-
-    while (bytes < maxBytes && (start + bytes) < limit) {
+    // _overruns carries the boundary for every reader, so the loop stops at the
+    // property block, the packet or the buffer without restating any of them.
+    while (bytes < maxBytes && !this._overruns(bytes + 1)) {
       current = this._list.readUInt8(start + bytes++)
       value += mul * (current & constants.VARBYTEINT_MASK)
       mul *= 0x80
@@ -668,16 +669,15 @@ class Parser extends EventEmitter {
         result = true
         break
       }
-      if (this._list.length <= bytes) {
-        break
-      }
     }
 
     // In the payload phase the whole packet is buffered, so running out of
-    // bytes means the varint is truncated by the packet boundary, not that more
-    // data is on the way (MQTT-5 §1.5.5 Malformed Packet).
+    // bytes means the varint is truncated by a boundary, not that more data is
+    // on the way (MQTT-5 §4.13 Malformed Packet).
     if (!result && ((bytes === maxBytes && this._list.length >= bytes) || this.packet.length !== -1)) {
-      this._emitError(new Error('Invalid variable byte integer'))
+      this._emitError(new Error(this.packet.length === -1
+        ? 'Invalid variable byte integer'
+        : 'Malformed ' + this.packet.cmd + ', invalid variable byte integer'))
     }
 
     // The header phase re-runs from _pos 0 until the whole varint has arrived,
@@ -742,7 +742,7 @@ class Parser extends EventEmitter {
 
   // Reads the property block into `target`, or returns false once the error is
   // emitted. Every caller must stop parsing on false.
-  _readProperties (target) {
+  _parsePropertiesInto (target) {
     const properties = this._parseProperties()
     if (properties === false) return false
     if (Object.getOwnPropertyNames(properties).length) {
@@ -758,14 +758,25 @@ class Parser extends EventEmitter {
     // `0` is a valid length, so only `false` means the varint itself failed;
     // _parseVarByteNum has already emitted.
     if (length === false) return false
-    const start = this._pos
-    const end = start + length
+    const end = this._pos + length
     // A declared property length that runs past this packet's boundary would
     // read the following pipelined packet's bytes. Treat that as malformed.
     if (this.packet.length !== -1 && end > this.packet.length) {
-      this._emitError(new Error('Property length exceeds ' + this.packet.cmd + ' packet length'))
+      this._emitError(new Error('Malformed ' + this.packet.cmd + ', property length exceeds remaining length'))
       return false
     }
+    // Inside the block every read is bounded by the declared length as well as
+    // by the packet, so a value cannot spill into the packet's own body.
+    const outerEnd = this._blockEnd
+    this._blockEnd = end
+    try {
+      return this._parsePropertyList(end)
+    } finally {
+      this._blockEnd = outerEnd
+    }
+  }
+
+  _parsePropertyList (end) {
     const result = {}
     while (this._pos < end) {
       const type = this._parseByte()
@@ -779,8 +790,11 @@ class Parser extends EventEmitter {
         return false
       }
       const value = this._parseByType(constants.propertiesTypes[name])
+      // A reader that reported its own failure has already emitted; a second
+      // error for the same packet would tear the connection down twice.
+      if (this.error) return false
       if (this._truncated) {
-        this._emitError(new Error('Property ' + name + ' exceeds ' + this.packet.cmd + ' packet length'))
+        this._emitError(new Error('Malformed ' + this.packet.cmd + ', property ' + name + ' exceeds the property length'))
         return false
       }
       // user properties process
@@ -827,6 +841,7 @@ class Parser extends EventEmitter {
 
     this._pos = 0
     this._truncated = false
+    this._blockEnd = -1
 
     return true
   }
