@@ -239,11 +239,12 @@ export declare type Packet = IConnectPacket |
   IAuthPacket
 
 export interface ParserError extends Error {
-  /** Always 'MALFORMED_PACKET': the packet violated the protocol and the
-   *  connection should be closed (MQTT-5 4.13). Match on this, not on message. */
-  code: string
-  /** The packet type being parsed, when the fixed header was read. */
-  cmd?: PacketCmd
+  /** The packet violated the protocol and the connection should be closed
+   *  (MQTT-5 4.13). Match on this, not on message. */
+  code: 'MALFORMED_PACKET'
+  /** The packet type being parsed, once the fixed header has been read.
+   *  'reserved' is packet type 0 or 15, which no version defines. */
+  cmd?: PacketCmd | 'reserved'
 }
 
 export interface Parser extends EventEmitter {

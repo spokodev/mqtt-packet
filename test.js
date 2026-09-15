@@ -119,12 +119,13 @@ function testParseOnly (name, object, buffer, opts) {
 
 function testParseError (expected, fixture, opts) {
   test(expected, t => {
-    t.plan(1)
+    t.plan(2)
 
     const parser = mqtt.parser(opts)
 
     parser.on('error', err => {
       t.equal(err.message, expected, 'expected error message')
+      t.equal(err.code, 'MALFORMED_PACKET', 'expected error code')
     })
 
     parser.on('packet', () => {

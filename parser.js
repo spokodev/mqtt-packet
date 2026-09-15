@@ -27,7 +27,7 @@ class Parser extends EventEmitter {
   }
 
   _resetState () {
-    debug('_resetState: resetting packet, error, _list, _pos, _truncated, _blockEnd, and _stateCounter')
+    debug('_resetState: dropping %d buffered bytes after %s', this._list ? this._list.length : 0, this.error ? this.error.message : 'no error')
     this.packet = new Packet()
     this.error = null
     this._list = bl()
@@ -93,7 +93,7 @@ class Parser extends EventEmitter {
   }
 
   _parsePayload () {
-    debug('_parsePayload: payload %O', this._list)
+    debug('_parsePayload: %d buffered bytes, packet length %d', this._list.length, this.packet.length)
     let result = false
 
     // Do we have a payload? Do we have enough data to complete the payload?
@@ -388,8 +388,8 @@ class Parser extends EventEmitter {
       packet.subscriptions.push(subscription)
     }
 
-    // The payload carries at least one topic filter [MQTT-3.8.3-3]; without this
-    // a property block that swallows the payload parses as an empty SUBSCRIBE.
+    // At least one topic filter, every version [MQTT-3.8.3-3]. Without this a
+    // packet whose payload is consumed upstream parses as an empty SUBSCRIBE.
     if (!packet.subscriptions.length) {
       return this._emitError(new Error('Malformed subscribe, no topic filters specified'))
     }
@@ -410,8 +410,8 @@ class Parser extends EventEmitter {
     }
 
     // Parse granted QoSes
-    while (this._pos < this.packet.length) {
-      const code = this._list.readUInt8(this._pos++)
+    while (!this._overruns(1)) {
+      const code = this._parseByte()
       if (this.settings.protocolVersion === 5) {
         if (!constants.MQTT5_SUBACK_CODES[code]) {
           return this._emitError(new Error('Invalid suback code'))
@@ -424,8 +424,9 @@ class Parser extends EventEmitter {
       this.packet.granted.push(code)
     }
 
-    // The payload carries one reason code per subscription (MQTT-5 §3.9.3), so
-    // an empty list means the property block ate them - silently, until now.
+    // One reason code per subscription, in 3.1.1 as well as 5.0 (§3.9.3). An
+    // empty list means something upstream - usually a property block - consumed
+    // the payload, which used to be accepted silently.
     if (!packet.granted.length) {
       return this._emitError(new Error('Malformed suback, no reason codes specified'))
     }
@@ -480,8 +481,8 @@ class Parser extends EventEmitter {
       // Parse granted QoSes
       packet.granted = []
 
-      while (this._pos < this.packet.length) {
-        const code = this._list.readUInt8(this._pos++)
+      while (!this._overruns(1)) {
+        const code = this._parseByte()
         if (!constants.MQTT5_UNSUBACK_CODES[code]) {
           return this._emitError(new Error('Invalid unsuback code'))
         }
@@ -489,6 +490,7 @@ class Parser extends EventEmitter {
       }
 
       // One reason code per unsubscription (MQTT-5 §3.11.3).
+      // Only 5.0 carries them; 3.1.1 UNSUBACK has no payload.
       if (!packet.granted.length) {
         return this._emitError(new Error('Malformed unsuback, no reason codes specified'))
       }
@@ -879,8 +881,8 @@ class Parser extends EventEmitter {
     // let a consumer react without matching on the message text, and the counts
     // say how much of the stream is about to be dropped - the next parse() calls
     // _resetState, and a consumer that tears down on error never gets there.
-    err.code = err.code || 'MALFORMED_PACKET'
-    if (this.packet.cmd) err.cmd = err.cmd || this.packet.cmd
+    err.code = 'MALFORMED_PACKET'
+    if (this.packet.cmd) err.cmd = this.packet.cmd
     debug('_emitError: %s (_pos %d, %d buffered bytes discarded)', err.message, this._pos, this._list.length)
     this.error = err
     this.emit('error', err)
