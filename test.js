@@ -845,82 +845,147 @@ testParseOnly('Version 5 DISCONNECT test 2', {
 ]), { protocolVersion: 5 }
 )
 
-test('Version 5 DISCONNECT/AUTH before another packet parses both at every remaining length', t => {
-  // A DISCONNECT/AUTH must be bounded by its own remaining length, not by the
-  // whole parse buffer, so a following packet is not mis-read as its reason
-  // code or properties. Remaining length 0 and 1 are the regression; 2 and
-  // above are the path this PR newly gates with `packet.length >= 2` and
-  // already worked, so they are here to keep working.
-  const pingreq = [192, 0]
-  const cases = [
-    { what: 'disconnect rl0', body: [224, 0], cmd: 'disconnect', rc: 0 },
-    { what: 'disconnect rl1', body: [224, 1, 128], cmd: 'disconnect', rc: 128 },
-    { what: 'disconnect rl2', body: [224, 2, 0, 0], cmd: 'disconnect', rc: 0 },
-    { what: 'disconnect rl7', body: [224, 7, 0, 5, 0x11, 0, 0, 0, 10], cmd: 'disconnect', rc: 0, props: { sessionExpiryInterval: 10 } },
-    { what: 'auth rl0', body: [240, 0], cmd: 'auth', rc: 0 },
-    { what: 'auth rl1', body: [240, 1, 24], cmd: 'auth', rc: 24 },
-    { what: 'auth rl2', body: [240, 2, 0, 0], cmd: 'auth', rc: 0 },
-    { what: 'auth rl7', body: [240, 7, 24, 5, 0x1F, 0, 2, 0x68, 0x69], cmd: 'auth', rc: 24, props: { reasonString: 'hi' } }
-  ]
-  for (const { what, body, cmd, rc, props } of cases) {
-    const parser = mqtt.parser({ protocolVersion: 5 })
-    const got = []
-    parser.on('packet', p => got.push(p))
-    parser.on('error', e => t.fail(`${what}: unexpected error: ${e.message}`))
-    const remaining = parser.parse(Buffer.from([...body, ...pingreq]))
-    t.deepEqual(got.map(p => p.cmd), [cmd, 'pingreq'], `${what}: both packets parsed`)
-    t.equal(got[0] && got[0].reasonCode, rc, `${what}: reason code`)
-    t.deepEqual(got[0] && got[0].properties, props, `${what}: properties`)
-    t.equal(remaining, 0, `${what}: remaining bytes`)
-  }
-  t.end()
-})
+// A packet's reason code and property block are bounded by its own remaining
+// length, not by the parse buffer, so a pipelined packet that follows is never
+// read as part of this one. Reading past the boundary is a Malformed Packet
+// (MQTT-5 §1.5.5): every such read errors rather than yielding a silent
+// null/-1, which is what the error cases below pin down.
+const PINGREQ = [0xC0, 0x00] // Fixed Header (PINGREQ, Remaining Length 0)
 
-test('Version 5 DISCONNECT invalid reason code emits a single error', t => {
-  // An invalid reason code must stop parsing, not fall through into the
-  // property block and emit a second error (mirrors _parseAuth's return).
-  t.plan(2)
-  const parser = mqtt.parser({ protocolVersion: 5 })
-  let errors = 0
-  parser.on('error', e => {
-    errors++
-    t.equal(e.message, 'Invalid disconnect reason code', 'reason code error')
-  })
-  parser.on('packet', () => t.fail('no packet after error'))
-  parser.parse(Buffer.from([224, 3, 0x03, 0x01, 0x99]))
-  t.equal(errors, 1, 'exactly one error')
-})
-
-test('Version 5 DISCONNECT/AUTH property length past remaining length errors, not over-reads', t => {
-  // A declared property length must stay within the packet's remaining length,
-  // otherwise _parseProperties would read the following pipelined packet.
+test('reason code and properties stop at the packet boundary when pipelined', t => {
   const cases = [
-    [224, 3, 0, 2, 1, 192, 0], // DISCONNECT rl3: propLen 2 > 1 available, then PINGREQ
-    [240, 3, 0, 2, 1, 192, 0] // AUTH, same shape
-  ]
-  t.plan(cases.length * 2)
-  for (const bytes of cases) {
-    const parser = mqtt.parser({ protocolVersion: 5 })
-    let errors = 0
-    parser.on('error', e => {
-      errors++
-      t.equal(e.message, 'Property length exceeds packet length', 'boundary error')
-    })
-    parser.on('packet', () => t.fail('no packet after boundary error'))
-    parser.parse(Buffer.from(bytes))
-    t.equal(errors, 1, 'exactly one error')
-  }
-})
-
-test('Version 5 CONNACK binds reason code and properties to the packet, not the buffer', t => {
-  // _parseConnack read reasonCode/properties by _list.length, so a pipelined
-  // packet's bytes leaked in (reasonCode became the next packet's header byte).
-  // Bound by packet.length; a trailing PINGREQ must survive untouched.
-  const ping = [0xC0, 0x00]
-  const cases = [
-    { bytes: [0x20, 0x01, 0x00, ...ping], rc: 0, props: undefined, what: 'remaining length 1, no reason code byte' },
-    { bytes: [0x20, 0x03, 0x00, 0x00, 0x00, ...ping], rc: 0, props: undefined, what: 'remaining length 3, empty properties' },
-    { bytes: [0x20, 0x06, 0x00, 0x00, 0x03, 0x21, 0x00, 0x0a, ...ping], rc: 0, props: { receiveMaximum: 10 }, what: 'remaining length 6, a property' }
+    {
+      what: 'DISCONNECT remaining length 0, implied reason code',
+      bytes: [0xE0, 0x00], // Fixed Header (DISCONNECT, Remaining Length 0)
+      cmd: 'disconnect',
+      rc: 0
+    },
+    {
+      what: 'DISCONNECT remaining length 1, reason code only',
+      bytes: [
+        0xE0, 0x01, // Fixed Header (DISCONNECT, Remaining Length 1)
+        0x80 // reason code (Unspecified error)
+      ],
+      cmd: 'disconnect',
+      rc: 0x80
+    },
+    {
+      what: 'DISCONNECT remaining length 2, empty property block',
+      bytes: [
+        0xE0, 0x02, // Fixed Header (DISCONNECT, Remaining Length 2)
+        0x00, // reason code (Normal disconnection)
+        0x00 // Property Length 0
+      ],
+      cmd: 'disconnect',
+      rc: 0
+    },
+    {
+      what: 'DISCONNECT remaining length 7, one property',
+      bytes: [
+        0xE0, 0x07, // Fixed Header (DISCONNECT, Remaining Length 7)
+        0x00, // reason code (Normal disconnection)
+        0x05, // Property Length 5
+        0x11, 0x00, 0x00, 0x00, 0x0A // property: sessionExpiryInterval (int32) = 10
+      ],
+      cmd: 'disconnect',
+      rc: 0,
+      props: { sessionExpiryInterval: 10 }
+    },
+    {
+      what: 'AUTH remaining length 0, implied reason code',
+      bytes: [0xF0, 0x00], // Fixed Header (AUTH, Remaining Length 0)
+      cmd: 'auth',
+      rc: 0
+    },
+    {
+      what: 'AUTH remaining length 1, reason code only',
+      bytes: [
+        0xF0, 0x01, // Fixed Header (AUTH, Remaining Length 1)
+        0x18 // reason code (Continue authentication)
+      ],
+      cmd: 'auth',
+      rc: 0x18
+    },
+    {
+      what: 'AUTH remaining length 2, empty property block',
+      bytes: [
+        0xF0, 0x02, // Fixed Header (AUTH, Remaining Length 2)
+        0x00, // reason code (Success)
+        0x00 // Property Length 0
+      ],
+      cmd: 'auth',
+      rc: 0
+    },
+    {
+      what: 'AUTH remaining length 6, a binary property',
+      bytes: [
+        0xF0, 0x06, // Fixed Header (AUTH, Remaining Length 6)
+        0x18, // reason code (Continue authentication)
+        0x04, // Property Length 4
+        0x16, 0x00, 0x01, 0xAA // property: authenticationData (binary) = <AA>
+      ],
+      cmd: 'auth',
+      rc: 0x18,
+      props: { authenticationData: Buffer.from([0xAA]) }
+    },
+    {
+      what: 'AUTH remaining length 7, a string property',
+      bytes: [
+        0xF0, 0x07, // Fixed Header (AUTH, Remaining Length 7)
+        0x18, // reason code (Continue authentication)
+        0x05, // Property Length 5
+        0x1F, 0x00, 0x02, 0x68, 0x69 // property: reasonString = 'hi'
+      ],
+      cmd: 'auth',
+      rc: 0x18,
+      props: { reasonString: 'hi' }
+    },
+    {
+      // The 1- and 2-byte forms are the ones 'Version 5 CONNACK test 1' and
+      // 'Version 4 CONACK in Version 5 mode' already document; the point here
+      // is that a following packet no longer supplies the missing bytes.
+      what: 'CONNACK remaining length 1, implied reason code',
+      bytes: [
+        0x20, 0x01, // Fixed Header (CONNACK, Remaining Length 1)
+        0x00 // Connect Acknowledge Flags (session not present)
+      ],
+      cmd: 'connack',
+      rc: 0
+    },
+    {
+      what: 'CONNACK remaining length 2, version 4 format',
+      bytes: [
+        0x20, 0x02, // Fixed Header (CONNACK, Remaining Length 2)
+        0x00, // Connect Acknowledge Flags (session not present)
+        0x01 // reason code (Unacceptable protocol version)
+      ],
+      cmd: 'connack',
+      rc: 1
+    },
+    {
+      what: 'CONNACK remaining length 3, empty property block',
+      bytes: [
+        0x20, 0x03, // Fixed Header (CONNACK, Remaining Length 3)
+        0x00, // Connect Acknowledge Flags (session not present)
+        0x00, // reason code (Success)
+        0x00 // Property Length 0
+      ],
+      cmd: 'connack',
+      rc: 0
+    },
+    {
+      what: 'CONNACK remaining length 6, one property',
+      bytes: [
+        0x20, 0x06, // Fixed Header (CONNACK, Remaining Length 6)
+        0x00, // Connect Acknowledge Flags (session not present)
+        0x00, // reason code (Success)
+        0x03, // Property Length 3
+        0x21, 0x00, 0x0A // property: receiveMaximum (int16) = 10
+      ],
+      cmd: 'connack',
+      rc: 0,
+      props: { receiveMaximum: 10 }
+    }
   ]
   t.plan(cases.length * 5)
   for (const c of cases) {
@@ -928,72 +993,157 @@ test('Version 5 CONNACK binds reason code and properties to the packet, not the 
     const packets = []
     parser.on('packet', p => packets.push(p))
     parser.on('error', e => t.fail(`${c.what}: unexpected error ${e.message}`))
-    const remaining = parser.parse(Buffer.from(c.bytes))
-    t.equal(packets.length, 2, `${c.what}: connack and the trailing pingreq`)
-    t.equal(packets[0].reasonCode, c.rc, `${c.what}: reason code`)
-    t.deepEqual(packets[0].properties, c.props, `${c.what}: properties`)
+    const remaining = parser.parse(Buffer.from([...c.bytes, ...PINGREQ]))
+    t.deepEqual(packets.map(p => p.cmd), [c.cmd, 'pingreq'], `${c.what}: both packets parsed`)
+    t.equal(packets[0] && packets[0].reasonCode, c.rc, `${c.what}: reason code`)
+    t.deepEqual(packets[0] && packets[0].properties, c.props, `${c.what}: properties`)
     t.equal(packets[1] && packets[1].cmd, 'pingreq', `${c.what}: pingreq intact`)
     t.equal(remaining, 0, `${c.what}: no bytes left over`)
   }
 })
 
-test('Version 4 CONNECT truncated before a pipelined packet errors, not over-reads', t => {
-  // The version and connect-flags gates used _list.length, so a following
-  // packet's byte was read as protocolVersion/flags instead of erroring.
-  t.plan(2)
-  const parser = mqtt.parser({ protocolVersion: 4 })
-  let errors = 0
-  parser.on('error', e => {
-    errors++
-    t.equal(e.message, 'Packet too short', 'truncated connect error')
-  })
-  parser.on('packet', () => t.fail('no packet from a truncated connect'))
-  // CONNECT remaining length 6 stops after the protocol name, then a PINGREQ
-  parser.parse(Buffer.from([0x10, 0x06, 0x00, 0x04, 77, 81, 84, 84, 0xC0, 0x00]))
-  t.equal(errors, 1, 'exactly one error')
-})
+// A declared Property Length that runs past the remaining length used to
+// absorb the following packet's header bytes into a property value.
+testParseError('Property length exceeds disconnect packet length', Buffer.from([
+  0xE0, 0x03, // Fixed Header (DISCONNECT, Remaining Length 3)
+  0x00, // reason code (Normal disconnection)
+  0x02, // Property Length 2, but only 1 byte is left in this packet
+  0x01, // property: payloadFormatIndicator
+  ...PINGREQ
+]), { protocolVersion: 5 })
 
-test('the parser recovers _pos after a mid-packet error', t => {
+testParseError('Property length exceeds auth packet length', Buffer.from([
+  0xF0, 0x03, // Fixed Header (AUTH, Remaining Length 3)
+  0x00, // reason code (Success)
+  0x02, // Property Length 2, but only 1 byte is left in this packet
+  0x01, // property: payloadFormatIndicator
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+// A Property Length varint whose continuation bit runs into the next packet.
+testParseError('Invalid variable byte integer', Buffer.from([
+  0xE0, 0x02, // Fixed Header (DISCONNECT, Remaining Length 2)
+  0x00, // reason code (Normal disconnection)
+  0x80, // Property Length, continuation bit set with no byte after it
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+testParseError('Invalid variable byte integer', Buffer.from([
+  0xF0, 0x02, // Fixed Header (AUTH, Remaining Length 2)
+  0x18, // reason code (Continue authentication)
+  0x80, // Property Length, continuation bit set with no byte after it
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+testParseError('Invalid variable byte integer', Buffer.from([
+  0x20, 0x03, // Fixed Header (CONNACK, Remaining Length 3)
+  0x00, // Connect Acknowledge Flags (session not present)
+  0x00, // reason code (Success)
+  0x80, // Property Length, continuation bit set with no byte after it
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+// A property value that straddles the boundary: _parseNum, _parse4ByteNum and
+// _parseBuffer stop at it, and the stop is reported rather than left as null.
+testParseError('Property receiveMaximum exceeds disconnect packet length', Buffer.from([
+  0xE0, 0x04, // Fixed Header (DISCONNECT, Remaining Length 4)
+  0x00, // reason code (Normal disconnection)
+  0x02, // Property Length 2
+  0x21, 0x00, // property: receiveMaximum (int16) missing its second byte
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+testParseError('Property sessionExpiryInterval exceeds disconnect packet length', Buffer.from([
+  0xE0, 0x05, // Fixed Header (DISCONNECT, Remaining Length 5)
+  0x00, // reason code (Normal disconnection)
+  0x03, // Property Length 3
+  0x11, 0x00, 0x00, // property: sessionExpiryInterval (int32) missing two bytes
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+testParseError('Property authenticationData exceeds disconnect packet length', Buffer.from([
+  0xE0, 0x05, // Fixed Header (DISCONNECT, Remaining Length 5)
+  0x00, // reason code (Normal disconnection)
+  0x03, // Property Length 3
+  0x16, 0x00, 0x05, // property: authenticationData declaring 5 bytes it does not have
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+testParseError('Property userProperties exceeds disconnect packet length', Buffer.from([
+  0xE0, 0x06, // Fixed Header (DISCONNECT, Remaining Length 6)
+  0x00, // reason code (Normal disconnection)
+  0x04, // Property Length 4
+  0x26, 0x00, 0x01, 0x61, // property: userProperties, name 'a' with no value
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+// A messageId that straddles the boundary used to be emitted as -1, or as two
+// bytes stolen from the next packet.
+testParseError('Cannot parse messageId', Buffer.from([
+  0x40, 0x01, // Fixed Header (PUBACK, Remaining Length 1)
+  0x00, // half a messageId
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+testParseError('Cannot parse messageId', Buffer.from([
+  0x90, 0x01, // Fixed Header (SUBACK, Remaining Length 1)
+  0x00, // half a messageId
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+// A CONNACK with no Connect Acknowledge Flags byte must be rejected, not
+// emitted as an empty packet with the next packet's byte for flags.
+testParseError('Packet too short', Buffer.from([
+  0x20, 0x00, // Fixed Header (CONNACK, Remaining Length 0)
+  ...PINGREQ
+]), { protocolVersion: 5 })
+
+// An invalid reason code must stop parsing, not fall through into the property
+// block and emit a second error (mirrors _parseAuth's return).
+testParseError('Invalid disconnect reason code', Buffer.from([
+  0xE0, 0x03, // Fixed Header (DISCONNECT, Remaining Length 3)
+  0x03, // reason code, not a valid DISCONNECT code
+  0x01, 0x99 // Property Length 1, property: unknown
+]), { protocolVersion: 5 })
+
+// The version and connect-flags gates used _list.length, so a following
+// packet's byte was read as protocolVersion/flags instead of erroring.
+testParseError('Packet too short', Buffer.from([
+  0x10, 0x06, // Fixed Header (CONNECT, Remaining Length 6)
+  0x00, 0x04, 0x4D, 0x51, 0x54, 0x54, // protocol name 'MQTT', then nothing
+  ...PINGREQ
+]), { protocolVersion: 4 })
+
+test('the parser stays usable after a packet-boundary error', t => {
   // _resetState did not clear _pos, so the next packet's _parseVarByteNum used
   // the stale value as padding and computed a bogus remaining length.
-  t.plan(4)
-  const parser = mqtt.parser({ protocolVersion: 4 })
-  const packets = []
-  parser.on('packet', p => packets.push(p))
-  parser.on('error', () => {})
-  // A malformed CONNECT errors mid-payload, leaving _pos non-zero
-  parser.parse(Buffer.from([0x10, 0x04, 0x00, 0x06, 0x4d, 0x51]))
-  t.equal(packets.length, 0, 'no packet from the malformed connect')
-  // A following valid PUBLISH must parse cleanly rather than wedge
-  const remaining = parser.parse(Buffer.from([48, 10, 0, 4, 116, 101, 115, 116, 116, 101, 115, 116]))
-  t.equal(packets.length, 1, 'the following publish parses')
-  t.equal(packets[0] && packets[0].topic, 'test', 'with the correct topic')
-  t.equal(remaining, 0, 'no bytes left over')
-})
-
-test('Version 5 DISCONNECT and AUTH stop at the packet boundary when pipelined', t => {
-  // The reason code and property block must be bound by the packet's remaining
-  // length so a trailing PINGREQ is not consumed as part of this packet.
-  const ping = [0xC0, 0x00]
-  const cases = [
-    { bytes: [0xE0, 0x00, ...ping], cmd: 'disconnect', rc: 0, props: undefined, what: 'DISCONNECT remaining length 0' },
-    { bytes: [0xE0, 0x02, 0x00, 0x00, ...ping], cmd: 'disconnect', rc: 0, props: undefined, what: 'DISCONNECT remaining length 2, empty properties' },
-    { bytes: [0xE0, 0x07, 0x00, 0x05, 0x11, 0x00, 0x00, 0x00, 0x0a, ...ping], cmd: 'disconnect', rc: 0, props: { sessionExpiryInterval: 10 }, what: 'DISCONNECT remaining length 7, a property' },
-    { bytes: [0xF0, 0x01, 0x18, ...ping], cmd: 'auth', rc: 0x18, props: undefined, what: 'AUTH remaining length 1' },
-    { bytes: [0xF0, 0x06, 0x18, 0x04, 0x16, 0x00, 0x01, 0xAA, ...ping], cmd: 'auth', rc: 0x18, props: { authenticationData: Buffer.from([0xAA]) }, what: 'AUTH remaining length 6, a property' }
+  const fixtures = [
+    // A malformed CONNECT that errors mid-payload, leaving _pos non-zero
+    [0x10, 0x04, 0x00, 0x06, 0x4D, 0x51],
+    // A DISCONNECT whose Property Length runs past its remaining length
+    [0xE0, 0x03, 0x00, 0x02, 0x01],
+    // A DISCONNECT whose property value straddles the boundary
+    [0xE0, 0x04, 0x00, 0x02, 0x21, 0x00]
   ]
-  t.plan(cases.length * 5)
-  for (const c of cases) {
+  t.plan(fixtures.length * 4)
+  for (const bytes of fixtures) {
     const parser = mqtt.parser({ protocolVersion: 5 })
     const packets = []
+    let errors = 0
     parser.on('packet', p => packets.push(p))
-    parser.on('error', e => t.fail(`${c.what}: unexpected error ${e.message}`))
-    const remaining = parser.parse(Buffer.from(c.bytes))
-    t.equal(packets.length, 2, `${c.what}: packet and the trailing pingreq`)
-    t.equal(packets[0].reasonCode, c.rc, `${c.what}: reason code`)
-    t.deepEqual(packets[0].properties, c.props, `${c.what}: properties`)
-    t.equal(packets[1] && packets[1].cmd, 'pingreq', `${c.what}: pingreq intact`)
-    t.equal(remaining, 0, `${c.what}: no bytes left over`)
+    parser.on('error', () => errors++)
+    parser.parse(Buffer.from(bytes))
+    t.equal(packets.length, 0, 'no packet from the malformed input')
+    t.equal(errors, 1, 'exactly one error')
+    // A following valid PUBLISH must parse cleanly rather than wedge
+    const remaining = parser.parse(Buffer.from([
+      0x30, 0x0B, // Fixed Header (PUBLISH, Remaining Length 11)
+      0x00, 0x04, 0x74, 0x65, 0x73, 0x74, // topic 'test'
+      0x00, // Property Length 0
+      0x74, 0x65, 0x73, 0x74 // payload 'test'
+    ]))
+    t.equal(packets[0] && packets[0].topic, 'test', 'the following publish parses')
+    t.equal(remaining, 0, 'no bytes left over')
   }
 })
 
@@ -3189,6 +3339,10 @@ testParseError('Malformed Subscribe Payload', Buffer.from([
 ]))
 
 test('Cannot parse property code type', t => {
+  // The trailing DISCONNECT used to be `224, 2, 0, 32`, which now trips the
+  // Property Length boundary check instead: remaining length 2 leaves no byte
+  // for the property the length declares. `224, 3, 0, 1, 0` keeps the property
+  // block inside the packet so the property code 0 is what fails, as intended.
   const packets = Buffer.from([
     16, 16, 0, 4, 77, 81, 84, 84, 5, 2, 0, 60, 3, 33, 0, 20, 0, 0, 98, 2, 211, 1, 224, 3, 0, 1, 0
   ])
