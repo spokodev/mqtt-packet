@@ -230,23 +230,24 @@ testGenerateError('Unknown command', {})
 
 testParseError('Not supported', Buffer.from([0, 1, 0]), {})
 
-// Length header field
-testParseError('Invalid variable byte integer', Buffer.from(
+// Length header field. The packet type is already known from the fixed header,
+// so the Remaining Length varint error names it like every other parse error.
+testParseError('Malformed connect, invalid variable byte integer', Buffer.from(
   [16, 255, 255, 255, 255]
 ), {})
-testParseError('Invalid variable byte integer', Buffer.from(
+testParseError('Malformed connect, invalid variable byte integer', Buffer.from(
   [16, 255, 255, 255, 128]
 ), {})
-testParseError('Invalid variable byte integer', Buffer.from(
+testParseError('Malformed connect, invalid variable byte integer', Buffer.from(
   [16, 255, 255, 255, 255, 1]
 ), {})
-testParseError('Invalid variable byte integer', Buffer.from(
+testParseError('Malformed connect, invalid variable byte integer', Buffer.from(
   [16, 255, 255, 255, 255, 127]
 ), {})
-testParseError('Invalid variable byte integer', Buffer.from(
+testParseError('Malformed connect, invalid variable byte integer', Buffer.from(
   [16, 255, 255, 255, 255, 128]
 ), {})
-testParseError('Invalid variable byte integer', Buffer.from(
+testParseError('Malformed connect, invalid variable byte integer', Buffer.from(
   [16, 255, 255, 255, 255, 255, 1]
 ), {})
 
@@ -768,7 +769,7 @@ testParseOnly('Version 5 PUBACK test 3', {
 )
 
 // A CONNACK always carries Connect Acknowledge Flags and a reason code
-// (MQTT-5 3.2.2). With only the flags byte there is no reason code to report,
+// (MQTT-5 §3.2.2). With only the flags byte there is no reason code to report,
 // and defaulting it to Success would tell the client an unauthenticated
 // connection was accepted - so remaining length 1 is rejected.
 testParseError('Malformed connack, packet too short', Buffer.from([
@@ -841,7 +842,7 @@ testParseOnly('Version 5 DISCONNECT test 2', {
 // A packet's reason code and property block are bounded by its own remaining
 // length, not by the parse buffer, so a pipelined packet that follows is never
 // read as part of this one. Reading past the boundary is a Malformed Packet
-// (MQTT-5 §1.5.5): every such read errors rather than yielding a silent
+// (MQTT-5 §4.13): every such read errors rather than yielding a silent
 // null/-1, which is what the error cases below pin down.
 const PINGREQ = [0xC0, 0x00] // Fixed Header (PINGREQ, Remaining Length 0)
 
@@ -1100,7 +1101,7 @@ testParseError('Packet too short', Buffer.from([
 
 // Every packet type that reads a property block stops on a malformed one. Each
 // case declares a Property Length longer than the bytes left in the packet, so
-// it exercises that type's own `_readProperties` call site.
+// it exercises that type's own `_parsePropertiesInto` call site.
 testParseError('Malformed connect, property length exceeds remaining length', Buffer.from([
   0x10, 0x0D, // Fixed Header (CONNECT, Remaining Length 13)
   0x00, 0x04, 0x4D, 0x51, 0x54, 0x54, // protocol name 'MQTT'
@@ -1204,7 +1205,7 @@ testParseError('Malformed publish, invalid variable byte integer', Buffer.from([
 ]), { protocolVersion: 5 })
 
 // The Property Length byte is mandatory in a v5 PUBLISH/SUBACK/UNSUBACK
-// (MQTT-5 3.3.2.3 / 3.9.2.1.1 / 3.11.2.1.1) - unlike DISCONNECT and AUTH,
+// (MQTT-5 §3.3.2.3 / §3.9.2.1.1 / §3.11.2.1.1) - unlike DISCONNECT and AUTH,
 // where the spec lets it be omitted below remaining length 2. These used to
 // parse as packets with no properties and an empty payload.
 testParseError('Malformed publish, invalid variable byte integer', Buffer.from([
@@ -1221,6 +1222,94 @@ testParseError('Malformed unsuback, invalid variable byte integer', Buffer.from(
   0xB0, 0x02, // Fixed Header (UNSUBACK, Remaining Length 2)
   0x00, 0x01 // messageId 1, and no Property Length
 ]), { protocolVersion: 5 })
+
+// A failed property read must stop the packet's parser before it reads the
+// fields that follow the property block. End to end this is invisible:
+// `_parsePropertiesInto` emits, and `parse()` refuses to emit a packet while
+// `this.error` is set, so dropping a guard changes nothing observable. Failing
+// the read WITHOUT setting the error isolates it: with the guard those fields
+// are never assigned, without it they are read from an offset now pointing into
+// the middle of the property block (a PUBLISH payload comes back as the
+// property bytes plus the real payload).
+//
+// CONNACK, PUBACK, DISCONNECT and AUTH read their properties last, so their
+// guards have nothing to stop and no test can distinguish them. They are here
+// for consistency, and this test covers the seven that do.
+test('a failed property read stops before the fields that follow it', t => {
+  const cases = [
+    {
+      what: 'connect packet properties',
+      call: 1,
+      packet: { cmd: 'connect', protocolVersion: 5, clientId: 'c', properties: { sessionExpiryInterval: 1 } },
+      untouched: p => !p || p.clientId === undefined
+    },
+    {
+      what: 'connect will properties',
+      call: 2,
+      packet: { cmd: 'connect', protocolVersion: 5, clientId: 'c', will: { topic: 't', payload: Buffer.from('p'), properties: { willDelayInterval: 1 } } },
+      untouched: p => !p || !p.will || p.will.topic === undefined
+    },
+    {
+      what: 'publish',
+      call: 1,
+      packet: { cmd: 'publish', topic: 't', payload: Buffer.from('p'), properties: { payloadFormatIndicator: true } },
+      untouched: p => !p || p.payload === null || p.payload === undefined
+    },
+    {
+      what: 'subscribe',
+      call: 1,
+      packet: { cmd: 'subscribe', messageId: 1, subscriptions: [{ topic: 't', qos: 0 }], properties: { subscriptionIdentifier: 1 } },
+      untouched: p => !p || !p.subscriptions || p.subscriptions.length === 0
+    },
+    {
+      what: 'suback',
+      call: 1,
+      packet: { cmd: 'suback', messageId: 1, granted: [0], properties: { reasonString: 'r' } },
+      untouched: p => !p || !p.granted || p.granted.length === 0
+    },
+    {
+      what: 'unsubscribe',
+      call: 1,
+      packet: { cmd: 'unsubscribe', messageId: 1, unsubscriptions: ['t'], properties: { reasonString: 'r' } },
+      untouched: p => !p || !p.unsubscriptions || p.unsubscriptions.length === 0
+    },
+    {
+      what: 'unsuback',
+      call: 1,
+      packet: { cmd: 'unsuback', messageId: 1, granted: [0], properties: { reasonString: 'r' } },
+      untouched: p => !p || !p.granted || p.granted.length === 0
+    }
+  ]
+  t.plan(cases.length * 4)
+  for (const c of cases) {
+    const fixture = mqtt.generate(c.packet, { protocolVersion: 5 })
+
+    // The unmodified parser must accept the fixture, or the case proves nothing
+    const control = mqtt.parser({ protocolVersion: 5 })
+    let controlPacket = null
+    control.on('packet', p => { controlPacket = p })
+    control.on('error', e => t.fail(`${c.what}: fixture is not valid: ${e.message}`))
+    control.parse(fixture)
+    t.ok(controlPacket && !c.untouched(controlPacket), `${c.what}: fixture parses in full`)
+
+    const parser = mqtt.parser({ protocolVersion: 5 })
+    const real = parser._parsePropertiesInto
+    let calls = 0
+    parser._parsePropertiesInto = function (target) {
+      if (++calls === c.call) return false
+      return real.call(this, target)
+    }
+    let got = null
+    let errors = 0
+    parser.on('packet', p => { got = p })
+    parser.on('error', () => errors++)
+    parser.parse(fixture)
+    t.equal(calls, c.call, `${c.what}: no property read after the failing one`)
+    t.ok(c.untouched(got), `${c.what}: the fields after the property block were never assigned`)
+    // The stub reports no error, so any error here came from reading on past it
+    t.equal(errors, 0, `${c.what}: no error raised past the failing property read`)
+  }
+})
 
 test('the parser stays usable after a packet-boundary error', t => {
   // _resetState did not clear _pos, so the next packet's _parseVarByteNum used

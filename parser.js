@@ -27,7 +27,11 @@ class Parser extends EventEmitter {
   }
 
   _resetState () {
-    debug('_resetState: resetting packet, error, _list, _pos, _truncated, _blockEnd, and _stateCounter')
+    // Log the discard: parse() returns _list.length before the reset, so this is
+    // the only place the number of bytes thrown away after an error is visible.
+    if (this._list) {
+      debug('_resetState: discarding %d buffered bytes at _pos %d of a %s packet', this._list.length, this._pos, this.packet.cmd)
+    }
     this.packet = new Packet()
     this.error = null
     this._list = bl()
@@ -417,6 +421,12 @@ class Parser extends EventEmitter {
       }
       this.packet.granted.push(code)
     }
+
+    // The payload carries one reason code per subscription (MQTT-5 §3.9.3), so
+    // an empty list means the property block ate them - silently, until now.
+    if (!packet.granted.length) {
+      return this._emitError(new Error('Malformed suback, no reason codes specified'))
+    }
   }
 
   _parseUnsubscribe () {
@@ -469,6 +479,11 @@ class Parser extends EventEmitter {
           return this._emitError(new Error('Invalid unsuback code'))
         }
         this.packet.granted.push(code)
+      }
+
+      // One reason code per unsubscription (MQTT-5 §3.11.3).
+      if (!packet.granted.length) {
+        return this._emitError(new Error('Malformed unsuback, no reason codes specified'))
       }
     }
   }
@@ -593,10 +608,15 @@ class Parser extends EventEmitter {
     const end = this._pos + n
     const limit = this._readEnd()
     if (limit !== -1 && end > limit) {
+      debug('_overruns: %d bytes at _pos %d cross the %s end %d', n, this._pos, this._blockEnd !== -1 ? 'property block' : 'packet', limit)
       this._truncated = true
       return true
     }
-    return end > this._list.length
+    if (end > this._list.length) {
+      debug('_overruns: %d bytes at _pos %d cross the buffer end %d', n, this._pos, this._list.length)
+      return true
+    }
+    return false
   }
 
   _parseString (maybeBuffer) {
@@ -675,9 +695,9 @@ class Parser extends EventEmitter {
     // bytes means the varint is truncated by a boundary, not that more data is
     // on the way (MQTT-5 §4.13 Malformed Packet).
     if (!result && ((bytes === maxBytes && this._list.length >= bytes) || this.packet.length !== -1)) {
-      this._emitError(new Error(this.packet.length === -1
-        ? 'Invalid variable byte integer'
-        : 'Malformed ' + this.packet.cmd + ', invalid variable byte integer'))
+      this._emitError(new Error(this.packet.cmd
+        ? 'Malformed ' + this.packet.cmd + ', invalid variable byte integer'
+        : 'Invalid variable byte integer'))
     }
 
     // The header phase re-runs from _pos 0 until the whole varint has arrived,
@@ -766,18 +786,22 @@ class Parser extends EventEmitter {
       return false
     }
     // Inside the block every read is bounded by the declared length as well as
-    // by the packet, so a value cannot spill into the packet's own body.
-    const outerEnd = this._blockEnd
+    // by the packet, so a value cannot spill into the packet's own body. Blocks
+    // never nest - CONNECT's will and packet properties are read in sequence -
+    // so the finally clears rather than restores, and it is there for the error
+    // returns below.
     this._blockEnd = end
     try {
-      return this._parsePropertyList(end)
+      return this._parsePropertyList()
     } finally {
-      this._blockEnd = outerEnd
+      this._blockEnd = -1
     }
   }
 
-  _parsePropertyList (end) {
+  _parsePropertyList () {
+    const end = this._blockEnd
     const result = {}
+    debug('_parsePropertyList: reading properties up to _pos %d', end)
     while (this._pos < end) {
       const type = this._parseByte()
       if (!type) {
@@ -789,6 +813,7 @@ class Parser extends EventEmitter {
         this._emitError(new Error('Unknown property'))
         return false
       }
+      debug('_parsePropertyList: property %s', name)
       const value = this._parseByType(constants.propertiesTypes[name])
       // A reader that reported its own failure has already emitted; a second
       // error for the same packet would tear the connection down twice.
